@@ -15,18 +15,91 @@ from pathlib import Path
 import plistlib
 import re
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
+import traceback
+
+
+def detect_language():
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/usr/bin/defaults", "export", "NSGlobalDomain", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                check=True, timeout=2,
+            )
+            languages = plistlib.loads(result.stdout).get("AppleLanguages", [])
+            if isinstance(languages, list) and languages and isinstance(languages[0], str):
+                return "zh" if languages[0].lower().startswith("zh") else "en"
+        except (OSError, subprocess.SubprocessError, ValueError, plistlib.InvalidFileException):
+            pass
+    language = next((os.environ[key] for key in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(key)), "en")
+    return "zh" if language.lower().startswith("zh") else "en"
+
+
+LANGUAGE = detect_language()
+
+MESSAGES = {
+    'no_device': ('未发现可连接的设备。首次使用请通过数据线配对一次；已配对的设备请确认已解锁，并检查 Wi-Fi 或 USB 连接。', 'No connectable devices found. For first-time use, pair once via USB. For paired devices, unlock them and check the Wi-Fi or USB connection.'),
+    'diagnostic': ('[诊断] {message}', '[Diagnostic] {message}'),
+    'error': ('错误：{error}', 'Error: {error}'),
+    'missing_dependencies': ('缺少依赖，请按 README 用当前 Python 安装 requirements.txt。', 'Missing dependencies. Install requirements.txt with your current Python as described in the README.'),
+    'dependency_mismatch': ('依赖版本与本工具不一致，请按 requirements.txt 安装：{packages}', 'Dependency versions do not match requirements.txt. Install: {packages}'),
+    'confirm_device': ('请确认要修改定位的设备：', 'Please confirm the device whose location you want to change:'),
+    'choose_device': ('发现多台设备，请选择目标：', 'Multiple devices found. Select the target:'),
+    'device_number': ('设备编号：', 'Device number: '),
+    'interactive_required': ('需要选择目标设备，请在交互终端运行。', 'A target device must be selected. Run this command in an interactive terminal.'),
+    'invalid_number': ('请输入 1 到 {count} 之间的编号。', 'Enter a number between 1 and {count}.'),
+    'already_running': ('本工具已在修改这台设备的定位，请先在原终端按 Ctrl+C。', "This tool is already simulating this device's location. Press Ctrl+C in the original terminal first."),
+    'usbmux_count': ('usbmuxd 返回 {count} 条连接记录。', 'usbmuxd returned {count} connection records.'),
+    'device_info_failed': ('读取设备 {udid}（{transport}）失败：{error}', 'Failed to read device {udid} ({transport}): {error}'),
+    'unknown_device': ('Apple 设备（信息暂不可读）', 'Apple device (information currently unavailable)'),
+    'device_count': ('去重后发现 {count} 台 iPhone / iPad。', 'Found {count} unique iPhone / iPad devices.'),
+    'transport_mismatch': ('实际连接与所选设备或连接方式不一致，已停止。', 'The connection does not match the selected device or transport. Stopped.'),
+    'downloading': ('正在下载开发者镜像…', 'Downloading the developer disk image…'),
+    'empty_image': ('下载的开发者镜像为空，请稍后重试。', 'The downloaded developer disk image is empty. Try again later.'),
+    'image_version_changed': ('上游镜像版本已变化，需要更新本工具的兼容版本。', 'The upstream disk image version has changed. Update this tool to a compatible version.'),
+    'device_mismatch': ('连接设备与所选设备不一致，已停止。', 'The connected device does not match the selected device. Stopped.'),
+    'disconnected': ('设备连接已断开。', 'The device connection was lost.'),
+    'connecting': ('尝试{transport}连接所选设备。', 'Trying a {transport} connection to the selected device.'),
+    'wireless': ('无线', 'wireless'),
+    'checking_device': ('连接已建立，检查配对、系统版本和开发者模式。', 'Connection established. Checking pairing, OS version, and Developer Mode.'),
+    'not_paired': ('设备尚未信任这台 Mac，或配对已过期。请通过数据线连接、解锁并确认“信任”。', 'The device has not trusted this Mac, or its pairing has expired. Connect via USB, unlock it, and confirm Trust.'),
+    'unsupported_os': ('本工具支持 iOS / iPadOS 17.4 及以上版本。', 'This tool requires iOS / iPadOS 17.4 or later.'),
+    'developer_mode_disabled': ('设备未开启开发者模式，请先完成设备端设置后重试。', 'Developer Mode is disabled. Enable it on the device and try again.'),
+    'mounting': ('正在挂载开发者镜像…', 'Mounting the developer disk image…'),
+    'starting_services': ('开发者镜像已就绪，正在建立隧道与定位服务。', 'The developer disk image is ready. Starting the tunnel and location service.'),
+    'tunnel_mismatch': ('隧道连接到其他设备，已停止。', 'The tunnel connected to a different device. Stopped.'),
+    'connected': ('已连接。', 'Connected.'),
+    'location_set': ('定位已修改为 {latitude}, {longitude}；按 Ctrl+C 还原定位并退出。', 'Location changed to {latitude}, {longitude}. Press Ctrl+C to restore the location and exit.'),
+    'session_error': ('定位会话结束时出现错误：{error}', 'The location session ended with an error: {error}'),
+    'usb_fallback': ('；回退到同一设备的 USB。', '; falling back to USB for the same device.'),
+    'connect_failed': ('无法连接所选设备，请确认已解锁并检查 Wi-Fi 或 USB 连接。', 'Cannot connect to the selected device. Unlock it and check the Wi-Fi or USB connection.'),
+    'description': ('无线优先，自动回退 USB；Ctrl+C 还原定位。', 'Prefer wireless, with automatic USB fallback. Ctrl+C restores the location.'),
+    'latitude_help': ('纬度（-90 到 90）', 'Latitude (-90 to 90)'),
+    'longitude_help': ('经度（-180 到 180）', 'Longitude (-180 to 180)'),
+    'latitude': ('纬度', 'Latitude'),
+    'longitude': ('经度', 'Longitude'),
+    'coordinate_error': ('{label}必须是 {minimum} 到 {maximum} 之间的有限数值', '{label} must be a finite number between {minimum} and {maximum}'),
+    'platform_required': ('需要 macOS 和 Python 3.11 或以上版本', 'macOS and Python 3.11 or later are required'),
+    'help': ('显示帮助并退出', 'Show this help message and exit'),
+    'arguments': ('参数', 'arguments'),
+    'options': ('选项', 'options'),
+    'discovering_usbmux': ('正在从 macOS usbmuxd 发现设备…', 'Discovering devices through macOS usbmuxd…'),
+    'checking_image': ('正在检查开发者镜像挂载状态。', 'Checking whether the developer disk image is mounted.'),
+}
+
+
+def tr(key, **values):
+    return MESSAGES[key][0 if LANGUAGE == "zh" else 1].format(**values)
+
 
 PROJECT = Path(__file__).resolve().parent
 CONNECT_TIMEOUT = 8
 SERVICE_TIMEOUT = 20
 CLEAR_TIMEOUT = 8
-NO_DEVICE = (
-    "未发现可连接的设备。首次使用请通过数据线配对一次；"
-    "已配对的设备请确认已解锁，并检查 Wi-Fi 或 USB 连接。"
-)
 
 
 class UserError(Exception):
@@ -38,6 +111,14 @@ class Device:
     udid: str
     name: str
     system: str = ""
+
+
+def diagnostic(message: str) -> None:
+    print(tr("diagnostic", message=message), file=sys.stderr, flush=True)
+
+
+def error_detail(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 def runtime_directory(project: Path = PROJECT, prefix: str | None = None,
@@ -63,25 +144,25 @@ def check_dependencies() -> None:
         mismatch = [f"{name}=={wanted}" for name, wanted in expected.items()
                     if version(name) != wanted]
     except PackageNotFoundError:
-        raise UserError("缺少依赖，请按 README 用当前 Python 安装 requirements.txt。") from None
+        raise UserError(tr("missing_dependencies")) from None
     if mismatch:
-        raise UserError("依赖版本与本工具不一致，请按 requirements.txt 安装：" + ", ".join(mismatch))
+        raise UserError(tr("dependency_mismatch", packages=", ".join(mismatch)))
 
 
 def select_device(devices: list[Device], input_fn=input, output=print) -> Device:
     if not devices:
-        raise UserError(NO_DEVICE)
-    output("请确认要修改定位的设备：" if len(devices) == 1 else "发现多台设备，请选择目标：")
+        raise UserError(tr("no_device"))
+    output(tr("confirm_device" if len(devices) == 1 else "choose_device"))
     for index, device in enumerate(devices, 1):
         output(f"  {index}. {device.name}  {device.system}  [{device.udid}]")
     while True:
         try:
-            answer = input_fn("设备编号：").strip()
+            answer = input_fn(tr("device_number")).strip()
         except EOFError:
-            raise UserError("需要选择目标设备，请在交互终端运行。") from None
+            raise UserError(tr("interactive_required")) from None
         if answer.isascii() and answer.isdecimal() and 1 <= int(answer) <= len(devices):
             return devices[int(answer) - 1]
-        output(f"请输入 1 到 {len(devices)} 之间的编号。")
+        output(tr("invalid_number", count=len(devices)))
 
 
 @contextmanager
@@ -93,7 +174,7 @@ def device_lock(state: Path, udid: str):
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise UserError("本工具已在修改这台设备的定位，请先在原终端按 Ctrl+C。") from None
+            raise UserError(tr("already_running")) from None
         try:
             yield
         finally:
@@ -104,7 +185,9 @@ async def discover() -> list[Device]:
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
 
+    diagnostic(tr("discovering_usbmux"))
     entries = await asyncio.wait_for(usbmux.list_devices(), CONNECT_TIMEOUT)
+    diagnostic(tr("usbmux_count", count=len(entries)))
     grouped: dict[str, set[str]] = {}
     for entry in entries:
         if entry.connection_type in {"Network", "USB"}:
@@ -127,13 +210,16 @@ async def discover() -> list[Device]:
                                   info.get("ProductVersion", ""))
                 finally:
                     await lockdown.close()
-            except Exception:
+            except Exception as exc:
+                diagnostic(tr("device_info_failed", udid=udid, transport=kind, error=error_detail(exc)))
                 continue
         # Keep an undisclosed/locked device selectable so errors concern that device.
-        return Device(udid, "Apple 设备（信息暂不可读）")
+        return Device(udid, tr("unknown_device"))
 
     devices = await asyncio.gather(*(describe(k, v) for k, v in sorted(grouped.items())))
-    return [device for device in devices if device is not None]
+    result = [device for device in devices if device is not None]
+    diagnostic(tr("device_count", count=len(result)))
+    return result
 
 
 async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
@@ -150,7 +236,7 @@ async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
                 return image, manifest, trust
         except (ValueError, plistlib.InvalidFileException):
             pass
-    print("正在下载开发者镜像…", flush=True)
+    print(tr("downloading"), flush=True)
     cancelled = threading.Event()
 
     def fetch():
@@ -172,11 +258,11 @@ async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
                                 return
                             handle.write(chunk)
                 if not target.stat().st_size:
-                    raise UserError("下载的开发者镜像为空，请稍后重试。")
+                    raise UserError(tr("empty_image"))
                 downloaded.append((target, local))
             data = plistlib.loads(downloaded[-1][0].read_bytes())
             if data.get("ProductBuildVersion") != LATEST_DDI_BUILD_ID:
-                raise UserError("上游镜像版本已变化，需要更新本工具的兼容版本。")
+                raise UserError(tr("image_version_changed"))
             for temporary_file, destination in downloaded:
                 os.replace(temporary_file, destination)
 
@@ -201,7 +287,7 @@ def tunnel_uses(lockdown):
 
     async def existing_connection(serial=None, **_):
         if serial != lockdown.udid:
-            raise UserError("连接设备与所选设备不一致，已停止。")
+            raise UserError(tr("device_mismatch"))
         return lockdown
 
     userspace_tunnel.create_using_usbmux = existing_connection
@@ -227,7 +313,7 @@ class Session:
     async def wait(self):
         # Unlike signal.sigwait(), this keeps the userspace tunnel's loop running.
         await asyncio.shield(self.dvt.dtx._reader_task)
-        raise UserError("设备连接已断开。")
+        raise UserError(tr("disconnected"))
 
 
 class Backend:
@@ -244,6 +330,7 @@ class Backend:
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
 
         async with AsyncExitStack() as resources:
+            diagnostic(tr("connecting", transport=tr("wireless") if transport == "Network" else "USB"))
             lockdown = await asyncio.wait_for(
                 create_using_usbmux(serial=device.udid, connection_type=transport, autopair=False),
                 CONNECT_TIMEOUT,
@@ -251,26 +338,29 @@ class Backend:
             resources.push_async_callback(lockdown.close)
             actual = lockdown.service.mux_device
             if actual is None or actual.connection_type != transport or not actual.matches_udid(device.udid):
-                raise UserError("实际连接与所选设备或连接方式不一致，已停止。")
+                raise UserError(tr("transport_mismatch"))
+            diagnostic(tr("checking_device"))
             if not lockdown.paired:
-                raise UserError("设备尚未信任这台 Mac，或配对已过期。请通过数据线连接、解锁并确认“信任”。")
+                raise UserError(tr("not_paired"))
             if Version(lockdown.product_version) < Version("17.4"):
-                raise UserError("本工具支持 iOS / iPadOS 17.4 及以上版本。")
+                raise UserError(tr("unsupported_os"))
             if not await asyncio.wait_for(lockdown.get_developer_mode_status(), CONNECT_TIMEOUT):
-                raise UserError("设备未开启开发者模式，请先完成设备端设置后重试。")
+                raise UserError(tr("developer_mode_disabled"))
 
+            diagnostic(tr("checking_image"))
             async with PersonalizedImageMounter(lockdown) as mounter:
                 if not await asyncio.wait_for(mounter.is_image_mounted("Personalized"), SERVICE_TIMEOUT):
                     assets = await download_ddi(self.state / "pymobiledevice3" / "Xcode_iOS_DDI_Personalized")
-                    print("正在挂载开发者镜像…", flush=True)
+                    print(tr("mounting"), flush=True)
                     # mount expects image, manifest, trust cache in this order.
                     await asyncio.wait_for(mounter.mount(*assets), 120)
 
+            diagnostic(tr("starting_services"))
             with tunnel_uses(lockdown):
                 tunnel = UserspaceRsdTunnel(serial=device.udid, autopair=False, remotepairing_fallback=False)
                 rsd = await asyncio.wait_for(resources.enter_async_context(tunnel), SERVICE_TIMEOUT)
                 if rsd.udid != device.udid:
-                    raise UserError("隧道连接到其他设备，已停止。")
+                    raise UserError(tr("tunnel_mismatch"))
                 dvt = await asyncio.wait_for(resources.enter_async_context(DvtProvider(rsd)), SERVICE_TIMEOUT)
                 location = await asyncio.wait_for(resources.enter_async_context(LocationSimulation(dvt)), SERVICE_TIMEOUT)
                 yield Session(location, dvt, transport)
@@ -278,6 +368,7 @@ class Backend:
 
 async def run_device(device, latitude, longitude, backend, output=print):
     failures = []
+    last_error = None
     for transport in ("Network", "USB"):
         entered = False
         try:
@@ -285,9 +376,9 @@ async def run_device(device, latitude, longitude, backend, output=print):
                 entered = True
                 # Once setting starts, do not switch devices/transports on failure.
                 try:
-                    output("已连接。")
+                    output(tr("connected"))
                     await session.set(latitude, longitude)
-                    output(f"定位已修改为 {latitude}, {longitude}；按 Ctrl+C 还原定位并退出。")
+                    output(tr("location_set", latitude=latitude, longitude=longitude))
                     await session.wait()
                 finally:
                     await session.clear()
@@ -295,9 +386,11 @@ async def run_device(device, latitude, longitude, backend, output=print):
             raise
         except Exception as exc:
             if entered:
-                raise UserError(f"定位会话结束时出现错误：{exc or type(exc).__name__}") from exc
-            failures.append(f"{transport}: {exc or type(exc).__name__}")
-    raise UserError("无法连接所选设备，请确认已解锁并检查 Wi-Fi 或 USB 连接。\n" + "\n".join(failures))
+                raise UserError(tr("session_error", error=error_detail(exc))) from exc
+            last_error = exc
+            failures.append(f"{transport}: {error_detail(exc)}")
+            diagnostic(failures[-1] + (tr("usb_fallback") if transport == "Network" else ""))
+    raise UserError(tr("connect_failed") + "\n" + "\n".join(failures)) from last_error
 
 
 async def execute(device, latitude, longitude, state):
@@ -323,20 +416,23 @@ async def execute(device, latitude, longitude, state):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="fake_position.sh", description="无线优先，自动回退 USB；Ctrl+C 还原定位。")
-    parser.add_argument("latitude", type=float, help="纬度（-90 到 90）")
-    parser.add_argument("longitude", type=float, help="经度（-180 到 180）")
+    parser = argparse.ArgumentParser(prog="fake_position.sh", description=tr("description"), add_help=False)
+    parser.add_argument("-h", "--help", action="help", help=tr("help"))
+    parser._positionals.title = tr("arguments")
+    parser._optionals.title = tr("options")
+    parser.add_argument("latitude", type=float, help=tr("latitude_help"))
+    parser.add_argument("longitude", type=float, help=tr("longitude_help"))
     args = parser.parse_args()
-    for value, limit, label in ((args.latitude, 90, "纬度"), (args.longitude, 180, "经度")):
+    for value, limit, label in ((args.latitude, 90, tr("latitude")), (args.longitude, 180, tr("longitude"))):
         if not math.isfinite(value) or not -limit <= value <= limit:
-            parser.error(f"{label}必须是 {-limit} 到 {limit} 之间的有限数值")
+            parser.error(tr("coordinate_error", label=label, minimum=-limit, maximum=limit))
     if sys.platform != "darwin" or sys.version_info < (3, 11):
-        parser.error("需要 macOS 和 Python 3.11 或以上版本")
+        parser.error(tr("platform_required"))
     try:
         check_dependencies()
         state = runtime_directory()
         configure_storage(state)
-        logging.basicConfig(level=logging.ERROR, format="%(name)s: %(message)s")
+        logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
         device = select_device(asyncio.run(discover()))
         with device_lock(state, device.udid):
             asyncio.run(execute(device, args.latitude, args.longitude, state))
@@ -344,7 +440,9 @@ def main():
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
-        print(f"错误：{exc or type(exc).__name__}", file=sys.stderr)
+        print(tr("error", error=error_detail(exc)), file=sys.stderr)
+        if not isinstance(exc, UserError) or exc.__cause__ is not None:
+            traceback.print_exception(exc)
         return 1
 
 
