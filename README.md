@@ -8,20 +8,13 @@
 
 Python 和依赖由用户自行安装。工具不会安装 Python、创建环境或自动更新依赖。
 
-使用项目内的 venv：
+在自己的 Python 环境中安装依赖：
 
 ```sh
-python3 -m venv venv
-venv/bin/python -m pip install --cache-dir venv/.cache/pip -r requirements.txt
+pip install -r requirements.txt
 ```
 
-不使用 venv，也可以安装到自己选择的 Python 环境：
-
-```sh
-python3 -m pip install -r requirements.txt
-```
-
-启动时优先使用项目中的 `venv/bin/python`；没有项目 venv 时，使用当前 `PATH` 中的 `python3`（也可以是用户已经激活的其他虚拟环境）。无需每次手动 `source`。
+脚本直接使用当前命令行环境中的 Python。
 
 ## 使用
 
@@ -45,9 +38,9 @@ python3 -m pip install -r requirements.txt
 
 ## 文件与退出
 
-使用虚拟环境时，工具的镜像缓存、临时文件和运行锁放在该环境的 `.fake_position/` 下；使用项目 venv 时即 `venv/.fake_position/`。不用虚拟环境时，放在项目的 `.fake_position/` 下。工具不往 `~/.pymobiledevice3` 写入缓存。
+使用虚拟环境时，工具的镜像缓存、临时文件和运行锁放在该环境的 `.fake_position/` 下。不用虚拟环境时，放在项目的 `.fake_position/` 下。工具不往 `~/.pymobiledevice3` 写入缓存。
 
-使用上面的 venv 安装方式时，删除 `venv` 即可删除该环境中的依赖、安装缓存和本工具运行文件。Python 由用户管理，项目源码单独保留。
+使用虚拟环境时，删除该环境即可删除其中的依赖和本工具运行文件。Python 由用户管理，项目源码单独保留。
 
 工具作为前台进程运行，不启动常驻服务，也不修改 macOS 的系统配置。退出时主动清除模拟定位并等待设备应答，随后释放本会话资源。
 
@@ -56,6 +49,6 @@ python3 -m pip install -r requirements.txt
 不连接设备的自动测试：
 
 ```sh
-venv/bin/python -B -m unittest discover -s tests -v
+python -B -m unittest discover -s tests -v
 ```
 
