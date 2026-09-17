@@ -327,7 +327,7 @@ async def execute(device, latitude, longitude, state):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="fake_position", description="无线优先，自动回退 USB；Ctrl+C 还原定位。")
+    parser = argparse.ArgumentParser(prog="fake_position.sh", description="无线优先，自动回退 USB；Ctrl+C 还原定位。")
     parser.add_argument("latitude", type=float, help="纬度（-90 到 90）")
     parser.add_argument("longitude", type=float, help="经度（-180 到 180）")
     args = parser.parse_args()
