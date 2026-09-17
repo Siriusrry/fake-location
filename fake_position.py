@@ -285,10 +285,9 @@ async def run_device(device, latitude, longitude, backend, output=print):
                 entered = True
                 # Once setting starts, do not switch devices/transports on failure.
                 try:
+                    output("已连接。")
                     await session.set(latitude, longitude)
-                    label = "无线" if transport == "Network" else "USB"
-                    output(f"已连接 {device.name}（{label}），定位已修改为 {latitude}, {longitude}。")
-                    output("定位已修改；按 Ctrl+C 还原定位并退出。")
+                    output(f"定位已修改为 {latitude}, {longitude}；按 Ctrl+C 还原定位并退出。")
                     await session.wait()
                 finally:
                     await session.clear()
