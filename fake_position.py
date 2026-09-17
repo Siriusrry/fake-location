@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import traceback
 
 
 def detect_language():
@@ -43,8 +42,6 @@ LANGUAGE = detect_language()
 
 MESSAGES = {
     'no_device': ('未发现可连接的设备。首次使用请通过数据线配对一次；已配对的设备请确认已解锁，并检查 Wi-Fi 或 USB 连接。', 'No connectable devices found. For first-time use, pair once via USB. For paired devices, unlock them and check the Wi-Fi or USB connection.'),
-    'diagnostic': ('[诊断] {message}', '[Diagnostic] {message}'),
-    'error': ('错误：{error}', 'Error: {error}'),
     'missing_dependencies': ('缺少依赖，请按 README 用当前 Python 安装 requirements.txt。', 'Missing dependencies. Install requirements.txt with your current Python as described in the README.'),
     'dependency_mismatch': ('依赖版本与本工具不一致，请按 requirements.txt 安装：{packages}', 'Dependency versions do not match requirements.txt. Install: {packages}'),
     'confirm_device': ('请确认要修改定位的设备：', 'Please confirm the device whose location you want to change:'),
@@ -73,7 +70,8 @@ MESSAGES = {
     'starting_services': ('开发者镜像已就绪，正在建立隧道与定位服务。', 'The developer disk image is ready. Starting the tunnel and location service.'),
     'tunnel_mismatch': ('隧道连接到其他设备，已停止。', 'The tunnel connected to a different device. Stopped.'),
     'connected': ('已连接。', 'Connected.'),
-    'location_set': ('定位已修改为 {latitude}, {longitude}；按 Ctrl+C 还原定位并退出。', 'Location changed to {latitude}, {longitude}. Press Ctrl+C to restore the location and exit.'),
+    'location_set': ('定位已修改为 {coordinates}。', 'Location changed to {coordinates}.'),
+    'exit_hint': ('按 {shortcut} 还原定位并退出。', 'Press {shortcut} to restore the location and exit.'),
     'session_error': ('定位会话结束时出现错误：{error}', 'The location session ended with an error: {error}'),
     'usb_fallback': ('；回退到同一设备的 USB。', '; falling back to USB for the same device.'),
     'connect_failed': ('无法连接所选设备，请确认已解锁并检查 Wi-Fi 或 USB 连接。', 'Cannot connect to the selected device. Unlock it and check the Wi-Fi or USB connection.'),
@@ -100,6 +98,48 @@ PROJECT = Path(__file__).resolve().parent
 CONNECT_TIMEOUT = 8
 SERVICE_TIMEOUT = 20
 CLEAR_TIMEOUT = 8
+LOGGER = logging.getLogger("fake_position")
+
+
+def colored(text: str, color: str, stream=None) -> str:
+    stream = sys.stdout if stream is None else stream
+    if not stream.isatty() or os.environ.get("TERM") == "dumb" or "NO_COLOR" in os.environ:
+        return text
+    return f"\033[{color}m{text}\033[0m"
+
+
+class ConsoleFormatter(logging.Formatter):
+    def __init__(self, stream):
+        super().__init__()
+        self.stream = stream
+
+    def format(self, record):
+        color = "31" if record.levelno >= logging.ERROR else "33" if record.levelno >= logging.WARNING else "34"
+        label = colored(f"[{record.levelname}]", color, self.stream)
+        message = record.getMessage()
+        if record.name != LOGGER.name:
+            message = f"{record.name}: {message}"
+        if record.levelno >= logging.ERROR:
+            message = colored(message, color, self.stream)
+        result = f"{label} {message}"
+        if record.exc_info:
+            result += "\n" + self.formatException(record.exc_info)
+        return result
+
+
+def configure_logging():
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(ConsoleFormatter(sys.stderr))
+    logging.basicConfig(level=logging.WARNING, handlers=[handler], force=True)
+    LOGGER.setLevel(logging.INFO)
+
+
+class CommandParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        LOGGER.error(message)
+        raise SystemExit(2)
 
 
 class UserError(Exception):
@@ -111,10 +151,6 @@ class Device:
     udid: str
     name: str
     system: str = ""
-
-
-def diagnostic(message: str) -> None:
-    print(tr("diagnostic", message=message), file=sys.stderr, flush=True)
 
 
 def error_detail(exc: Exception) -> str:
@@ -185,9 +221,9 @@ async def discover() -> list[Device]:
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
 
-    diagnostic(tr("discovering_usbmux"))
+    LOGGER.info(tr("discovering_usbmux"))
     entries = await asyncio.wait_for(usbmux.list_devices(), CONNECT_TIMEOUT)
-    diagnostic(tr("usbmux_count", count=len(entries)))
+    LOGGER.info(tr("usbmux_count", count=len(entries)))
     grouped: dict[str, set[str]] = {}
     for entry in entries:
         if entry.connection_type in {"Network", "USB"}:
@@ -211,14 +247,14 @@ async def discover() -> list[Device]:
                 finally:
                     await lockdown.close()
             except Exception as exc:
-                diagnostic(tr("device_info_failed", udid=udid, transport=kind, error=error_detail(exc)))
+                LOGGER.warning(tr("device_info_failed", udid=udid, transport=kind, error=error_detail(exc)))
                 continue
         # Keep an undisclosed/locked device selectable so errors concern that device.
         return Device(udid, tr("unknown_device"))
 
     devices = await asyncio.gather(*(describe(k, v) for k, v in sorted(grouped.items())))
     result = [device for device in devices if device is not None]
-    diagnostic(tr("device_count", count=len(result)))
+    LOGGER.info(tr("device_count", count=len(result)))
     return result
 
 
@@ -236,7 +272,7 @@ async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
                 return image, manifest, trust
         except (ValueError, plistlib.InvalidFileException):
             pass
-    print(tr("downloading"), flush=True)
+    LOGGER.info(tr("downloading"))
     cancelled = threading.Event()
 
     def fetch():
@@ -330,7 +366,7 @@ class Backend:
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
 
         async with AsyncExitStack() as resources:
-            diagnostic(tr("connecting", transport=tr("wireless") if transport == "Network" else "USB"))
+            LOGGER.info(tr("connecting", transport=tr("wireless") if transport == "Network" else "USB"))
             lockdown = await asyncio.wait_for(
                 create_using_usbmux(serial=device.udid, connection_type=transport, autopair=False),
                 CONNECT_TIMEOUT,
@@ -339,7 +375,7 @@ class Backend:
             actual = lockdown.service.mux_device
             if actual is None or actual.connection_type != transport or not actual.matches_udid(device.udid):
                 raise UserError(tr("transport_mismatch"))
-            diagnostic(tr("checking_device"))
+            LOGGER.info(tr("checking_device"))
             if not lockdown.paired:
                 raise UserError(tr("not_paired"))
             if Version(lockdown.product_version) < Version("17.4"):
@@ -347,15 +383,15 @@ class Backend:
             if not await asyncio.wait_for(lockdown.get_developer_mode_status(), CONNECT_TIMEOUT):
                 raise UserError(tr("developer_mode_disabled"))
 
-            diagnostic(tr("checking_image"))
+            LOGGER.info(tr("checking_image"))
             async with PersonalizedImageMounter(lockdown) as mounter:
                 if not await asyncio.wait_for(mounter.is_image_mounted("Personalized"), SERVICE_TIMEOUT):
                     assets = await download_ddi(self.state / "pymobiledevice3" / "Xcode_iOS_DDI_Personalized")
-                    print(tr("mounting"), flush=True)
+                    LOGGER.info(tr("mounting"))
                     # mount expects image, manifest, trust cache in this order.
                     await asyncio.wait_for(mounter.mount(*assets), 120)
 
-            diagnostic(tr("starting_services"))
+            LOGGER.info(tr("starting_services"))
             with tunnel_uses(lockdown):
                 tunnel = UserspaceRsdTunnel(serial=device.udid, autopair=False, remotepairing_fallback=False)
                 rsd = await asyncio.wait_for(resources.enter_async_context(tunnel), SERVICE_TIMEOUT)
@@ -378,7 +414,8 @@ async def run_device(device, latitude, longitude, backend, output=print):
                 try:
                     output(tr("connected"))
                     await session.set(latitude, longitude)
-                    output(tr("location_set", latitude=latitude, longitude=longitude))
+                    output(tr("location_set", coordinates=colored(f"{latitude}, {longitude}", "1;36")))
+                    output(tr("exit_hint", shortcut=colored("Ctrl+C", "1;33")))
                     await session.wait()
                 finally:
                     await session.clear()
@@ -389,7 +426,8 @@ async def run_device(device, latitude, longitude, backend, output=print):
                 raise UserError(tr("session_error", error=error_detail(exc))) from exc
             last_error = exc
             failures.append(f"{transport}: {error_detail(exc)}")
-            diagnostic(failures[-1] + (tr("usb_fallback") if transport == "Network" else ""))
+            if transport == "Network":
+                LOGGER.warning(failures[-1] + tr("usb_fallback"))
     raise UserError(tr("connect_failed") + "\n" + "\n".join(failures)) from last_error
 
 
@@ -416,7 +454,8 @@ async def execute(device, latitude, longitude, state):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="fake_position.sh", description=tr("description"), add_help=False)
+    configure_logging()
+    parser = CommandParser(prog="fake_position.sh", description=tr("description"), add_help=False)
     parser.add_argument("-h", "--help", action="help", help=tr("help"))
     parser._positionals.title = tr("arguments")
     parser._optionals.title = tr("options")
@@ -432,7 +471,6 @@ def main():
         check_dependencies()
         state = runtime_directory()
         configure_storage(state)
-        logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
         device = select_device(asyncio.run(discover()))
         with device_lock(state, device.udid):
             asyncio.run(execute(device, args.latitude, args.longitude, state))
@@ -440,9 +478,7 @@ def main():
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
-        print(tr("error", error=error_detail(exc)), file=sys.stderr)
-        if not isinstance(exc, UserError) or exc.__cause__ is not None:
-            traceback.print_exception(exc)
+        LOGGER.error(error_detail(exc), exc_info=not isinstance(exc, UserError) or exc.__cause__ is not None)
         return 1
 
 
