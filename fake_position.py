@@ -163,6 +163,7 @@ class UserError(Exception):
 class Device:
     udid: str
     name: str
+    transports: tuple[str, ...]
     system: str = ""
     requires_pairing: bool = False
 
@@ -204,8 +205,9 @@ def select_device(devices: list[Device], input_fn=input, output=print) -> Device
         raise UserError(tr("no_device"))
     output(tr("confirm_device" if len(devices) == 1 else "choose_device"))
     for index, device in enumerate(devices, 1):
+        connections = ", ".join("Wi-Fi" if kind == "Network" else kind for kind in device.transports)
         status = f" ({tr('usb_pairing_needed')})" if device.requires_pairing else ""
-        output(f"  {index}. {device.name}  {device.system}  [{device.udid}]{status}")
+        output(f"  {index}. {device.name}  {device.system}  [{connections}]  [{device.udid}]{status}")
     while True:
         try:
             answer = input_fn(tr("device_number")).strip()
@@ -269,7 +271,12 @@ async def discover() -> list[Device]:
                             raise UserError(tr("device_mismatch"))
                     elif kind != "USB":
                         raise ConnectionError(tr("network_pairing_required"))
-                    return Device(udid, name, system, requires_pairing=not lockdown.paired)
+                    return Device(
+                        udid=udid, name=name, system=system,
+                        # Advertised transports, not a connectivity check of every path.
+                        transports=tuple(kind for kind in ("USB", "Network") if kind in transports),
+                        requires_pairing=not lockdown.paired,
+                    )
                 finally:
                     await lockdown.close()
             except Exception as exc:
