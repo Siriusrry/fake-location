@@ -52,8 +52,20 @@ MESSAGES = {
     'already_running': ('本工具已在修改这台设备的定位，请先在原终端按 Ctrl+C。', "This tool is already simulating this device's location. Press Ctrl+C in the original terminal first."),
     'usbmux_count': ('usbmuxd 返回 {count} 条连接记录。', 'usbmuxd returned {count} connection records.'),
     'device_info_failed': ('读取设备 {udid}（{transport}）失败：{error}', 'Failed to read device {udid} ({transport}): {error}'),
-    'unknown_device': ('Apple 设备（信息暂不可读）', 'Apple device (information currently unavailable)'),
-    'device_count': ('去重后发现 {count} 台 iPhone / iPad。', 'Found {count} unique iPhone / iPad devices.'),
+    'device_count': ('已确认 {count} 台 iPhone / iPad 的连接和基本信息。', 'Verified connections and basic information for {count} iPhone / iPad devices.'),
+    'device_info_incomplete': ('设备 {udid} 未返回完整的名称和系统版本，跳过该连接。', 'Device {udid} did not return a complete name and OS version. Skipping this connection.'),
+    'usb_pairing_needed': ('USB，待配对', 'USB, pairing required'),
+    'network_pairing_required': ('无线连接没有有效的配对会话，需要通过 USB 配对。', 'No valid pairing session is available over wireless. USB pairing is required.'),
+    'pairing_prompt': ('所选 USB 设备尚无有效配对。请解锁设备，点击“信任”并按提示输入密码（等待 {seconds} 秒）。', 'The selected USB device has no valid pairing. Unlock it, tap Trust, and enter its passcode if prompted (waiting up to {seconds} seconds).'),
+    'pairing_failed': ('USB 配对未完成：{error}', 'USB pairing did not complete: {error}'),
+    'pairing_invalid': ('设备未通过配对后的会话验证，已停止。', 'The device failed session validation after pairing. Stopped.'),
+    'pairing_ready': ('USB 配对会话已验证。', 'USB pairing session verified.'),
+    'wifi_checking': ('正在检查所选 USB 设备的 Wi-Fi 连接开关。', 'Checking the Wi-Fi connection setting on the selected USB device.'),
+    'wifi_already_enabled': ('Wi-Fi 连接已开启，无需修改。', 'Wi-Fi connections are already enabled. No change needed.'),
+    'wifi_enabling': ('Wi-Fi 连接未开启，正在启用。', 'Wi-Fi connections are disabled. Enabling them.'),
+    'wifi_enabled': ('Wi-Fi 连接已开启，回读确认成功。', 'Wi-Fi connections enabled and confirmed by reading the setting back.'),
+    'wifi_verify_failed': ('设置后回读的 Wi-Fi 连接开关仍未开启。', 'The Wi-Fi connection setting is still disabled after the update.'),
+    'wifi_setup_failed': ('自动配置 Wi-Fi 连接失败：{error}；本次继续使用 USB。', 'Automatic Wi-Fi connection setup failed: {error}. Continuing over USB for this session.'),
     'transport_mismatch': ('实际连接与所选设备或连接方式不一致，已停止。', 'The connection does not match the selected device or transport. Stopped.'),
     'downloading': ('正在下载开发者镜像…', 'Downloading the developer disk image…'),
     'empty_image': ('下载的开发者镜像为空，请稍后重试。', 'The downloaded developer disk image is empty. Try again later.'),
@@ -96,6 +108,7 @@ def tr(key, **values):
 
 PROJECT = Path(__file__).resolve().parent
 CONNECT_TIMEOUT = 8
+PAIR_TIMEOUT = 60
 SERVICE_TIMEOUT = 20
 CLEAR_TIMEOUT = 8
 LOGGER = logging.getLogger("fake_position")
@@ -151,6 +164,7 @@ class Device:
     udid: str
     name: str
     system: str = ""
+    requires_pairing: bool = False
 
 
 def error_detail(exc: Exception) -> str:
@@ -190,7 +204,8 @@ def select_device(devices: list[Device], input_fn=input, output=print) -> Device
         raise UserError(tr("no_device"))
     output(tr("confirm_device" if len(devices) == 1 else "choose_device"))
     for index, device in enumerate(devices, 1):
-        output(f"  {index}. {device.name}  {device.system}  [{device.udid}]")
+        status = f" ({tr('usb_pairing_needed')})" if device.requires_pairing else ""
+        output(f"  {index}. {device.name}  {device.system}  [{device.udid}]{status}")
     while True:
         try:
             answer = input_fn(tr("device_number")).strip()
@@ -239,23 +254,75 @@ async def discover() -> list[Device]:
                     CONNECT_TIMEOUT,
                 )
                 try:
+                    verify_transport(lockdown, udid, kind)
                     info = lockdown.all_values
-                    if info.get("DeviceClass") not in ("iPhone", "iPad"):
+                    # Unpaired USB devices may expose ProductType but omit DeviceClass.
+                    device_type = info.get("DeviceClass")
+                    product_type = info.get("ProductType", "")
+                    if device_type not in ("iPhone", "iPad") and not re.fullmatch(r"(?:iPhone|iPad)\d+,\d+", str(product_type)):
                         return None
-                    return Device(udid, info.get("DeviceName") or info["DeviceClass"],
-                                  info.get("ProductVersion", ""))
+                    name, system = info.get("DeviceName"), info.get("ProductVersion")
+                    if not all(isinstance(value, str) and value.strip() for value in (name, system)):
+                        raise UserError(tr("device_info_incomplete", udid=udid))
+                    if lockdown.paired:
+                        if lockdown.udid != udid:
+                            raise UserError(tr("device_mismatch"))
+                    elif kind != "USB":
+                        raise ConnectionError(tr("network_pairing_required"))
+                    return Device(udid, name, system, requires_pairing=not lockdown.paired)
                 finally:
                     await lockdown.close()
             except Exception as exc:
                 LOGGER.warning(tr("device_info_failed", udid=udid, transport=kind, error=error_detail(exc)))
                 continue
-        # Keep an undisclosed/locked device selectable so errors concern that device.
-        return Device(udid, tr("unknown_device"))
+        return None
 
     devices = await asyncio.gather(*(describe(k, v) for k, v in sorted(grouped.items())))
     result = [device for device in devices if device is not None]
     LOGGER.info(tr("device_count", count=len(result)))
     return result
+
+
+def verify_transport(lockdown, udid: str, transport: str) -> None:
+    actual = lockdown.service.mux_device
+    if actual is None or actual.connection_type != transport or not actual.matches_udid(udid):
+        raise UserError(tr("transport_mismatch"))
+
+
+async def prepare_pairing(lockdown, udid: str, transport: str) -> None:
+    """Use the current validated session, never a saved 'first use' flag."""
+    if not lockdown.paired:
+        if transport != "USB":
+            raise ConnectionError(tr("network_pairing_required"))
+        LOGGER.info(tr("pairing_prompt", seconds=PAIR_TIMEOUT))
+        try:
+            await asyncio.wait_for(lockdown.pair(timeout=PAIR_TIMEOUT), PAIR_TIMEOUT + CONNECT_TIMEOUT)
+            if not await asyncio.wait_for(lockdown.validate_pairing(), CONNECT_TIMEOUT):
+                raise UserError(tr("pairing_invalid"))
+        except UserError:
+            raise
+        except Exception as exc:
+            raise UserError(tr("pairing_failed", error=error_detail(exc))) from exc
+        LOGGER.info(tr("pairing_ready"))
+    # Pairing can reveal the UDID that an unpaired device omitted earlier.
+    if lockdown.udid != udid:
+        raise UserError(tr("device_mismatch"))
+
+
+async def enable_wifi_on_usb(lockdown) -> None:
+    """Configure the selected, paired USB device; preserve working wired access."""
+    LOGGER.info(tr("wifi_checking"))
+    try:
+        if await asyncio.wait_for(lockdown.get_enable_wifi_connections(), CONNECT_TIMEOUT):
+            LOGGER.info(tr("wifi_already_enabled"))
+            return
+        LOGGER.info(tr("wifi_enabling"))
+        await asyncio.wait_for(lockdown.set_enable_wifi_connections(True), CONNECT_TIMEOUT)
+        if not await asyncio.wait_for(lockdown.get_enable_wifi_connections(), CONNECT_TIMEOUT):
+            raise UserError(tr("wifi_verify_failed"))
+        LOGGER.info(tr("wifi_enabled"))
+    except Exception as exc:
+        LOGGER.warning(tr("wifi_setup_failed", error=error_detail(exc)))
 
 
 async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
@@ -372,14 +439,13 @@ class Backend:
                 CONNECT_TIMEOUT,
             )
             resources.push_async_callback(lockdown.close)
-            actual = lockdown.service.mux_device
-            if actual is None or actual.connection_type != transport or not actual.matches_udid(device.udid):
-                raise UserError(tr("transport_mismatch"))
+            verify_transport(lockdown, device.udid, transport)
             LOGGER.info(tr("checking_device"))
-            if not lockdown.paired:
-                raise UserError(tr("not_paired"))
             if Version(lockdown.product_version) < Version("17.4"):
                 raise UserError(tr("unsupported_os"))
+            await prepare_pairing(lockdown, device.udid, transport)
+            if transport == "USB":
+                await enable_wifi_on_usb(lockdown)
             if not await asyncio.wait_for(lockdown.get_developer_mode_status(), CONNECT_TIMEOUT):
                 raise UserError(tr("developer_mode_disabled"))
 
