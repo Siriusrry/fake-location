@@ -73,6 +73,7 @@ MESSAGES = {
     'device_mismatch': ('连接设备与所选设备不一致，已停止。', 'The connected device does not match the selected device. Stopped.'),
     'disconnected': ('设备连接已断开。', 'The device connection was lost.'),
     'connecting': ('尝试{transport}连接所选设备。', 'Trying a {transport} connection to the selected device.'),
+    'reusing_connection': ('复用所选设备已验证的{transport}连接。', 'Reusing the verified {transport} connection to the selected device.'),
     'wireless': ('无线', 'wireless'),
     'checking_device': ('连接已建立，检查配对、系统版本和开发者模式。', 'Connection established. Checking pairing, OS version, and Developer Mode.'),
     'not_paired': ('设备尚未信任这台 Mac，或配对已过期。请通过数据线连接、解锁并确认“信任”。', 'The device has not trusted this Mac, or its pairing has expired. Connect via USB, unlock it, and confirm Trust.'),
@@ -166,6 +167,7 @@ class Device:
     transports: tuple[str, ...]
     system: str = ""
     requires_pairing: bool = False
+    lockdown: object | None = None
 
 
 def error_detail(exc: Exception) -> str:
@@ -234,6 +236,14 @@ def device_lock(state: Path, udid: str):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+async def close_device_connections(devices) -> None:
+    async with AsyncExitStack() as resources:
+        for device in devices:
+            if device.lockdown is not None:
+                resources.push_async_callback(device.lockdown.close)
+                device.lockdown = None
+
+
 async def discover() -> list[Device]:
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
@@ -245,6 +255,7 @@ async def discover() -> list[Device]:
     for entry in entries:
         if entry.connection_type in {"Network", "USB"}:
             grouped.setdefault(entry.serial, set()).add(entry.connection_type)
+    devices: list[Device] = []
 
     async def describe(udid, transports):
         for kind in ("Network", "USB"):
@@ -271,23 +282,34 @@ async def discover() -> list[Device]:
                             raise UserError(tr("device_mismatch"))
                     elif kind != "USB":
                         raise ConnectionError(tr("network_pairing_required"))
-                    return Device(
+                    device = Device(
                         udid=udid, name=name, system=system,
                         # Advertised transports, not a connectivity check of every path.
-                        transports=tuple(kind for kind in ("USB", "Network") if kind in transports),
+                        transports=tuple(kind for kind in ("Network", "USB") if kind in transports),
                         requires_pairing=not lockdown.paired,
+                        lockdown=lockdown,
                     )
+                    devices.append(device)
+                    lockdown = None  # Ownership moves to the candidate until selection.
+                    return
                 finally:
-                    await lockdown.close()
+                    if lockdown is not None:
+                        await lockdown.close()
             except Exception as exc:
                 LOGGER.warning(tr("device_info_failed", udid=udid, transport=kind, error=error_detail(exc)))
                 continue
         return None
 
-    devices = await asyncio.gather(*(describe(k, v) for k, v in sorted(grouped.items())))
-    result = [device for device in devices if device is not None]
-    LOGGER.info(tr("device_count", count=len(result)))
-    return result
+    try:
+        async with asyncio.TaskGroup() as tasks:
+            for udid, transports in grouped.items():
+                tasks.create_task(describe(udid, transports))
+    except BaseException:
+        await close_device_connections(devices)
+        raise
+    devices.sort(key=lambda device: device.udid)
+    LOGGER.info(tr("device_count", count=len(devices)))
+    return devices
 
 
 def verify_transport(lockdown, udid: str, transport: str) -> None:
@@ -440,11 +462,15 @@ class Backend:
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
 
         async with AsyncExitStack() as resources:
-            LOGGER.info(tr("connecting", transport=tr("wireless") if transport == "Network" else "USB"))
-            lockdown = await asyncio.wait_for(
-                create_using_usbmux(serial=device.udid, connection_type=transport, autopair=False),
-                CONNECT_TIMEOUT,
-            )
+            if device.lockdown is not None:
+                lockdown, device.lockdown = device.lockdown, None
+                LOGGER.info(tr("reusing_connection", transport=tr("wireless") if transport == "Network" else "USB"))
+            else:
+                LOGGER.info(tr("connecting", transport=tr("wireless") if transport == "Network" else "USB"))
+                lockdown = await asyncio.wait_for(
+                    create_using_usbmux(serial=device.udid, connection_type=transport, autopair=False),
+                    CONNECT_TIMEOUT,
+                )
             resources.push_async_callback(lockdown.close)
             verify_transport(lockdown, device.udid, transport)
             LOGGER.info(tr("checking_device"))
@@ -478,7 +504,11 @@ class Backend:
 async def run_device(device, latitude, longitude, backend, output=print):
     failures = []
     last_error = None
-    for transport in ("Network", "USB"):
+    transports = ("Network", "USB")
+    if device.lockdown is not None and device.lockdown.service.mux_device.connection_type == "USB":
+        # Discovery already preferred wireless; keep its working USB fallback.
+        transports = ("USB",)
+    for transport in transports:
         entered = False
         try:
             async with backend.connect(device, transport) as session:
@@ -544,9 +574,16 @@ def main():
         check_dependencies()
         state = runtime_directory()
         configure_storage(state)
-        device = select_device(asyncio.run(discover()))
-        with device_lock(state, device.udid):
-            asyncio.run(execute(device, args.latitude, args.longitude, state))
+        # Keep discovery streams on the same event loop used by the location session.
+        with asyncio.Runner() as runner:
+            devices = runner.run(discover())
+            try:
+                device = select_device(devices)
+                runner.run(close_device_connections(candidate for candidate in devices if candidate is not device))
+                with device_lock(state, device.udid):
+                    runner.run(execute(device, args.latitude, args.longitude, state))
+            finally:
+                runner.run(close_device_connections(devices))
         return 0
     except KeyboardInterrupt:
         return 0
