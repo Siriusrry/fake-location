@@ -71,9 +71,7 @@ def check_dependencies() -> None:
 def select_device(devices: list[Device], input_fn=input, output=print) -> Device:
     if not devices:
         raise UserError(NO_DEVICE)
-    if len(devices) == 1:
-        return devices[0]
-    output("发现多台设备，请选择目标：")
+    output("请确认要修改定位的设备：" if len(devices) == 1 else "发现多台设备，请选择目标：")
     for index, device in enumerate(devices, 1):
         output(f"  {index}. {device.name}  {device.system}  [{device.udid}]")
     while True:
@@ -289,12 +287,11 @@ async def run_device(device, latitude, longitude, backend, output=print):
                 try:
                     await session.set(latitude, longitude)
                     label = "无线" if transport == "Network" else "USB"
-                    output(f"已连接 {device.name}（{label}），定位设为 {latitude}, {longitude}。")
-                    output("保持运行；按 Ctrl+C 还原定位并退出。")
+                    output(f"已连接 {device.name}（{label}），定位已修改为 {latitude}, {longitude}。")
+                    output("定位已修改；按 Ctrl+C 还原定位并退出。")
                     await session.wait()
                 finally:
                     await session.clear()
-                    output("已清除模拟定位。")
         except UserError:
             raise
         except Exception as exc:
@@ -320,7 +317,7 @@ async def execute(device, latitude, longitude, state):
     try:
         await run_device(device, latitude, longitude, Backend(state))
     except asyncio.CancelledError:
-        print("已退出。", flush=True)
+        pass
     finally:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(sig)
@@ -346,7 +343,6 @@ def main():
             asyncio.run(execute(device, args.latitude, args.longitude, state))
         return 0
     except KeyboardInterrupt:
-        print("已退出。")
         return 0
     except Exception as exc:
         print(f"错误：{exc or type(exc).__name__}", file=sys.stderr)
