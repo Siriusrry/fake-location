@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Siriusrry
+
 """Foreground location simulation for macOS and iOS/iPadOS 17.4+."""
 
 from __future__ import annotations

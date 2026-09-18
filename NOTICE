@@ -1,0 +1,25 @@
+fake-location
+Copyright (C) 2026 Siriusrry
+SPDX-License-Identifier: GPL-3.0-or-later
+
+The original project code is free software: you can redistribute it and/or
+modify it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+A copy of the GNU General Public License is included in LICENSE.
+
+Third-party dependencies retain their own copyright notices and licenses:
+
+- pymobiledevice3: GPL-3.0-or-later
+  https://github.com/doronz88/pymobiledevice3
+- pmd-pytcp: GPL-3.0-or-later
+  https://github.com/ccie18643/PyTCP
+
+Developer disk images are downloaded separately and are not included in this
+repository. Their rights are not granted by this project's license.
