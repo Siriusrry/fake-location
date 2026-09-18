@@ -22,7 +22,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
+import tty
 
 
 def detect_language():
@@ -53,7 +55,7 @@ MESSAGES = {
     'device_number': ('设备编号：', 'Device number: '),
     'interactive_required': ('需要选择目标设备，请在交互终端运行。', 'A target device must be selected. Run this command in an interactive terminal.'),
     'invalid_number': ('请输入 1 到 {count} 之间的编号。', 'Enter a number between 1 and {count}.'),
-    'already_running': ('本工具已在修改这台设备的定位，请先在原终端按 Ctrl+C。', "This tool is already simulating this device's location. Press Ctrl+C in the original terminal first."),
+    'already_running': ('本工具已在修改这台设备的定位，请先在原终端按 x 结束。', "This tool is already simulating this device's location. Press x in the original terminal to stop it first."),
     'usbmux_count': ('usbmuxd 返回 {count} 条连接记录。', 'usbmuxd returned {count} connection records.'),
     'device_info_failed': ('读取设备 {udid}（{transport}）失败：{error}', 'Failed to read device {udid} ({transport}): {error}'),
     'device_count': ('已获取 {count} 台 iPhone / iPad 的设备列表信息。', 'Collected device-list information for {count} iPhone / iPad devices.'),
@@ -89,11 +91,12 @@ MESSAGES = {
     'tunnel_mismatch': ('隧道连接到其他设备，已停止。', 'The tunnel connected to a different device. Stopped.'),
     'connected': ('已连接。', 'Connected.'),
     'location_set': ('定位已修改为 {coordinates}。', 'Location changed to {coordinates}.'),
-    'exit_hint': ('按 {shortcut} 还原定位并退出。', 'Press {shortcut} to restore the location and exit.'),
+    'exit_hint': ('按 {shortcut} 结束定位修改并退出。', 'Press {shortcut} to stop location simulation and exit.'),
+    'location_ended': ('定位修改已结束。若设备定位异常或长时间未恢复，请重启设备。', 'Location simulation has ended. If the device location is incorrect or does not return to normal after an extended period, restart the device.'),
     'session_error': ('定位会话结束时出现错误：{error}', 'The location session ended with an error: {error}'),
     'usb_fallback': ('；回退到同一设备的 USB。', '; falling back to USB for the same device.'),
     'connect_failed': ('无法连接所选设备，请确认已解锁并检查 Wi-Fi 或 USB 连接。', 'Cannot connect to the selected device. Unlock it and check the Wi-Fi or USB connection.'),
-    'description': ('修改设备定位；Ctrl+C 还原定位并退出。', 'Change the device location. Press Ctrl+C to restore the location and exit.'),
+    'description': ('修改设备定位；按 x 结束定位修改并退出。', 'Change the device location. Press x to stop location simulation and exit.'),
     'latitude_help': ('纬度（-90 到 90）', 'Latitude (-90 to 90)'),
     'longitude_help': ('经度（-180 到 180）', 'Longitude (-180 to 180)'),
     'latitude': ('纬度', 'Latitude'),
@@ -733,6 +736,43 @@ class Backend:
                 yield await self.open_location_session(resources, rsd, transport)
 
 
+@contextmanager
+def listen_for_exit_key(stop, stream=None):
+    """Read x immediately without blocking the tunnel; restore terminal settings on exit."""
+    stream = sys.stdin if stream is None else stream
+    if not stream.isatty():
+        # Redirected input cannot use terminal key mode; signal cleanup still works.
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    fd = stream.fileno()
+    previous = termios.tcgetattr(fd)
+    watching = False
+
+    def read_key():
+        nonlocal watching
+        try:
+            key = os.read(fd, 1)
+        except OSError:
+            key = b""
+        if key in (b"x", b""):
+            loop.remove_reader(fd)
+            watching = False
+            stop()
+
+    try:
+        # Keep signal keys available for emergency interruption. The normal exit
+        # key is x, with no Enter required and no character echoed to the console.
+        tty.setcbreak(fd, when=termios.TCSANOW)
+        loop.add_reader(fd, read_key)
+        watching = True
+        yield
+    finally:
+        if watching:
+            loop.remove_reader(fd)
+        termios.tcsetattr(fd, termios.TCSANOW, previous)
+
+
 async def run_device(device, latitude, longitude, backend, output=print):
     failures = []
     last_error = None
@@ -741,6 +781,7 @@ async def run_device(device, latitude, longitude, backend, output=print):
     transports = device.routes
     for index, transport in enumerate(transports):
         entered = False
+        cleared = False
         try:
             async with backend.connect(device, transport) as session:
                 entered = True
@@ -749,10 +790,15 @@ async def run_device(device, latitude, longitude, backend, output=print):
                     output(tr("connected"))
                     await session.set(latitude, longitude)
                     output(tr("location_set", coordinates=colored(f"{latitude}, {longitude}", "1;36")))
-                    output(tr("exit_hint", shortcut=colored("Ctrl+C", "1;33")))
+                    output(tr("exit_hint", shortcut=colored("x", "1;33")))
                     await session.wait()
                 finally:
                     await session.clear()
+                    cleared = True
+        except asyncio.CancelledError:
+            if cleared:
+                output(tr("location_ended"))
+            raise
         except UserError:
             raise
         except Exception as exc:
@@ -782,7 +828,8 @@ async def execute(device, latitude, longitude, state):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop)
     try:
-        await run_device(device, latitude, longitude, Backend(state))
+        with listen_for_exit_key(stop):
+            await run_device(device, latitude, longitude, Backend(state))
     except asyncio.CancelledError:
         pass
     finally:
