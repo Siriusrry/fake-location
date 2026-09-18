@@ -7,6 +7,7 @@ import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import logging
 import math
@@ -52,8 +53,8 @@ MESSAGES = {
     'already_running': ('本工具已在修改这台设备的定位，请先在原终端按 Ctrl+C。', "This tool is already simulating this device's location. Press Ctrl+C in the original terminal first."),
     'usbmux_count': ('usbmuxd 返回 {count} 条连接记录。', 'usbmuxd returned {count} connection records.'),
     'device_info_failed': ('读取设备 {udid}（{transport}）失败：{error}', 'Failed to read device {udid} ({transport}): {error}'),
-    'device_count': ('已确认 {count} 台 iPhone / iPad 的连接和基本信息。', 'Verified connections and basic information for {count} iPhone / iPad devices.'),
-    'device_info_incomplete': ('设备 {udid} 未返回完整的名称和系统版本，跳过该连接。', 'Device {udid} did not return a complete name and OS version. Skipping this connection.'),
+    'device_count': ('已获取 {count} 台 iPhone / iPad 的设备列表信息。', 'Collected device-list information for {count} iPhone / iPad devices.'),
+    'device_info_incomplete': ('设备 {udid} 未返回完整的名称、机型和系统版本，跳过该记录。', 'Device {udid} did not return a complete name, model, and OS version. Skipping this record.'),
     'usb_pairing_needed': ('USB，待配对', 'USB, pairing required'),
     'network_pairing_required': ('无线连接没有有效的配对会话，需要通过 USB 配对。', 'No valid pairing session is available over wireless. USB pairing is required.'),
     'pairing_prompt': ('所选 USB 设备尚无有效配对。请解锁设备，点击“信任”并按提示输入密码（等待 {seconds} 秒）。', 'The selected USB device has no valid pairing. Unlock it, tap Trust, and enter its passcode if prompted (waiting up to {seconds} seconds).'),
@@ -69,7 +70,8 @@ MESSAGES = {
     'transport_mismatch': ('实际连接与所选设备或连接方式不一致，已停止。', 'The connection does not match the selected device or transport. Stopped.'),
     'downloading': ('正在下载开发者镜像…', 'Downloading the developer disk image…'),
     'empty_image': ('下载的开发者镜像为空，请稍后重试。', 'The downloaded developer disk image is empty. Try again later.'),
-    'image_version_changed': ('上游镜像版本已变化，需要更新本工具的兼容版本。', 'The upstream disk image version has changed. Update this tool to a compatible version.'),
+    'image_version_changed': ('开发者镜像版本与本工具固定的兼容版本不一致，已停止。', 'The developer disk image does not match the compatible version pinned by this tool. Stopped.'),
+    'image_integrity_failed': ('开发者镜像文件 {name} 校验失败，未使用该下载，请重试。', 'Developer disk image file {name} failed integrity verification. The download was not used; please retry.'),
     'device_mismatch': ('连接设备与所选设备不一致，已停止。', 'The connected device does not match the selected device. Stopped.'),
     'disconnected': ('设备连接已断开。', 'The device connection was lost.'),
     'connecting': ('尝试{transport}连接所选设备。', 'Trying a {transport} connection to the selected device.'),
@@ -80,7 +82,7 @@ MESSAGES = {
     'unsupported_os': ('本工具支持 iOS / iPadOS 17.4 及以上版本。', 'This tool requires iOS / iPadOS 17.4 or later.'),
     'developer_mode_disabled': ('设备未开启开发者模式，请先完成设备端设置后重试。', 'Developer Mode is disabled. Enable it on the device and try again.'),
     'mounting': ('正在挂载开发者镜像…', 'Mounting the developer disk image…'),
-    'starting_services': ('开发者镜像已就绪，正在建立隧道与定位服务。', 'The developer disk image is ready. Starting the tunnel and location service.'),
+    'starting_services': ('正在建立隧道并检查定位服务。', 'Starting the tunnel and checking the location service.'),
     'tunnel_mismatch': ('隧道连接到其他设备，已停止。', 'The tunnel connected to a different device. Stopped.'),
     'connected': ('已连接。', 'Connected.'),
     'location_set': ('定位已修改为 {coordinates}。', 'Location changed to {coordinates}.'),
@@ -102,14 +104,20 @@ MESSAGES = {
     'discovering_native': ('正在发现设备…', 'Discovering devices…'),
     'native_count': ('发现 {count} 条设备记录。', 'Found {count} device records.'),
     'discovery_failed': ('{source} 发现失败：{error}；继续使用另一发现来源。', '{source} discovery failed: {error}. Continuing with the other discovery source.'),
-    'native_info': ('正在读取设备 {udid} 的信息。', 'Reading information for device {udid}.'),
+    'native_info': ('已从原生发现结果获取设备 {udid} 的列表信息。', 'Obtained list information for device {udid} from native discovery.'),
     'native_connection': ('Apple 原生连接', 'Apple native connection'),
     'native_connecting': ('正在连接所选设备。', 'Connecting to the selected device.'),
     'native_reusing': ('使用所选设备已建立的连接。', 'Using the existing connection to the selected device.'),
     'route_fallback': ('{route}：{error}；继续尝试同一设备的 {next_route}。', '{route}: {error}; trying {next_route} for the same device.'),
     'refreshing_native': ('开发者镜像已挂载，正在刷新服务列表。', 'The developer disk image was mounted. Refreshing services.'),
     'usb_access_setup_failed': ('USB 配对或无线访问配置失败：{error}；继续使用当前连接，后续无线访问尚未确认就绪。', 'USB pairing or Wi-Fi access setup failed: {error}. Continuing with the current connection; future wireless access is not confirmed ready.'),
-    'starting_location_service': ('正在连接定位服务。', 'Connecting to the location service.'),
+    'starting_location_service': ('正在检查定位模拟服务是否可用。', 'Checking whether the location simulation service is available.'),
+    'location_service_ready': ('定位模拟服务已连接并通过可用性检查。', 'The location simulation service is connected and passed the availability check.'),
+    'location_service_missing': ('设备未提供定位所需的调试服务；镜像已挂载不代表该服务可用。请重启设备后重试，若仍失败请更新本工具。', 'The device does not advertise the debugging service required for location simulation. A mounted image does not guarantee service availability. Restart the device and retry; update this tool if the problem persists.'),
+    'location_service_connect_failed': ('无法建立定位调试连接：{error}', 'Could not establish the location debugging connection: {error}'),
+    'location_service_probe_failed': ('定位模拟服务未通过可用性检查：{error}', 'The location simulation service failed its availability check: {error}'),
+    'location_prepare_failed': ('无法为所选设备准备定位模拟服务，各连接路径的错误如下：', 'Could not prepare location simulation for the selected device. Errors for each connection path follow:'),
+    'unsupported_device': ('实际连接的设备不是支持的 iPhone / iPad，已停止。', 'The connected device is not a supported iPhone / iPad. Stopped.'),
     'checking_image': ('正在检查开发者镜像挂载状态。', 'Checking whether the developer disk image is mounted.'),
 }
 
@@ -125,6 +133,16 @@ PAIR_TIMEOUT = 60
 SERVICE_TIMEOUT = 20
 CLEAR_TIMEOUT = 8
 LOGGER = logging.getLogger("fake_position")
+
+# Keep the build, immutable repository revision, and file digests in sync.
+# This bundle matches the image previously used with the pinned SDK.
+DDI_BUILD_ID = "27A5228h"
+DDI_REVISION = "a719045a6470a8db988235230f6430b2b7df51fe"
+DDI_ASSETS = (
+    ("Image.dmg", "Image.dmg", "05fd807da5e19f030fa4941f24800c965c6c77982ab572dd5d1ef778fb69f9ca"),
+    ("BuildManifest.plist", "BuildManifest.plist", "8edd4a2f4f4ef1fbd7bfe49785d8badc673d1395d1d94d85b132ca8ab5ecaf54"),
+    ("Image.trustcache", "Image.dmg.trustcache", "36af60889ff5a737874a26daeb8e1a0139ebfebec6ec2e4d8f6a3c1bf1dce35c"),
+)
 
 
 def colored(text: str, color: str, stream=None) -> str:
@@ -170,6 +188,10 @@ class CommandParser(argparse.ArgumentParser):
 
 class UserError(Exception):
     """An actionable failure shown without an internal traceback."""
+
+
+class LocationServiceError(Exception):
+    """A service preparation failure that still permits same-device fallback."""
 
 
 @dataclass
@@ -290,22 +312,51 @@ async def open_native_tunnel(udid):
     return tunnel
 
 
+def text_value(*values):
+    return next((value.strip() for value in values if isinstance(value, str) and value.strip()), "")
+
+
+def supported_device(model, device_class=""):
+    """Return None for unknown types; never classify by a user-assigned name."""
+    if re.fullmatch(r"[A-Za-z]+\d+,\d+", model):
+        return bool(re.fullmatch(r"(?:iPhone|iPad)\d+,\d+", model))
+    if device_class in ("iPhone", "iPad"):
+        return True
+    if device_class in ("Watch", "AppleTV", "iPod", "Mac", "RealityDevice"):
+        return False
+    return None
+
+
 async def discover() -> list[Device]:
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
     from pymobiledevice3.remote.native_tunnel import browse_native_devices
+    from pymobiledevice3.remote.remote_service_discovery import parse_device_kvs_data
 
-    # Collect native deviceFound events before taking the usbmux snapshot. One
-    # source failing must not hide devices reported by the other source.
     LOGGER.info(tr("discovering_native"))
     try:
         native_entries = await finish_on_cancel(browse_native_devices(timeout=DISCOVERY_SECONDS))
     except Exception as exc:
         LOGGER.warning(tr("discovery_failed", source="remotepairingd", error=error_detail(exc)))
         native_entries = []
-    native_udids = {entry["udid"] for entry in native_entries
-                    if isinstance(entry.get("udid"), str) and entry["udid"]}
-    LOGGER.info(tr("native_count", count=len(native_udids)))
+    native_info = {}
+    for entry in native_entries:
+        udid = text_value(entry.get("udid"))
+        if not udid:
+            continue
+        values = parse_device_kvs_data(entry.get("deviceKVSData")).get("NULL", {})
+        if not isinstance(values, dict):
+            values = {}
+        info = native_info.setdefault(udid, {})
+        for key, value in {
+            "name": text_value(entry.get("name"), values.get("DeviceName")),
+            "model": text_value(entry.get("model"), values.get("ProductType")),
+            "system": text_value(values.get("ProductVersion")),
+            "device_class": text_value(values.get("DeviceClass")),
+        }.items():
+            if value:
+                info[key] = value
+    LOGGER.info(tr("native_count", count=len(native_info)))
 
     LOGGER.info(tr("discovering_usbmux"))
     try:
@@ -318,78 +369,70 @@ async def discover() -> list[Device]:
     for entry in entries:
         if entry.connection_type in {"Network", "USB"}:
             grouped.setdefault(entry.serial, set()).add(entry.connection_type)
-    for udid in native_udids:
+    for udid in native_info:
         grouped.setdefault(udid, set())
     devices: list[Device] = []
 
     async def describe(udid, transports):
-        # Let macOS choose the native transport. Explicit Wi-Fi and USB paths
-        # remain fallbacks; a USB connection is never required for wireless use.
-        routes = ("Native", "Network", "USB")
-        for index, kind in enumerate(routes):
-            if (kind == "Native" and udid not in native_udids) or (kind != "Native" and kind not in transports):
+        info = native_info.get(udid, {})
+        model = info.get("model", "")
+        supported = supported_device(model, info.get("device_class", ""))
+        # Filter the merged device, not just its native route: a known Watch
+        # must not return through a usbmux record with the same identifier.
+        if supported is False:
+            return
+        advertised = tuple(kind for kind in ("Network", "USB") if kind in transports)
+        if supported is True and all(info.get(key) for key in ("name", "model", "system")):
+            LOGGER.info(tr("native_info", udid=udid))
+            devices.append(Device(
+                udid=udid, name=info["name"], system=info["system"], transports=advertised,
+                routes=("Native", "Network", "USB"),
+            ))
+            return
+
+        # Metadata is advisory and can be incomplete. Query only these devices
+        # over usbmux, including usbmux-only devices whose type is still unknown.
+        # Do not open native tunnels or trigger native pairing before selection.
+        for kind in ("Network", "USB"):
+            if kind not in transports:
                 continue
             lockdown = None
-            native_tunnel = None
             try:
                 try:
-                    if kind == "Native":
-                        LOGGER.info(tr("native_info", udid=udid))
-                        native_tunnel = await open_native_tunnel(udid)
-                        provider = native_tunnel.rsd
-                        if provider.udid != udid:
-                            raise UserError(tr("device_mismatch"))
-                    else:
-                        lockdown = await asyncio.wait_for(
-                            create_using_usbmux(serial=udid, connection_type=kind, autopair=False),
-                            CONNECT_TIMEOUT,
-                        )
-                        verify_transport(lockdown, udid, kind)
-                        provider = lockdown
-                    info = provider.all_values
-                    # Unpaired USB devices may expose ProductType but omit DeviceClass.
-                    device_type = info.get("DeviceClass")
-                    product_type = info.get("ProductType") or provider.product_type or ""
-                    if device_type not in ("iPhone", "iPad") and not re.fullmatch(r"(?:iPhone|iPad)\d+,\d+", str(product_type)):
-                        return None
-                    name = info.get("DeviceName")
-                    system = info.get("ProductVersion")
-                    if kind == "Native" and not system:
-                        system = provider.peer_info["Properties"].get("OSVersion")
-                    if not all(isinstance(value, str) and value.strip() for value in (name, system)):
+                    lockdown = await asyncio.wait_for(
+                        create_using_usbmux(serial=udid, connection_type=kind, autopair=False),
+                        CONNECT_TIMEOUT,
+                    )
+                    verify_transport(lockdown, udid, kind)
+                    values = lockdown.all_values
+                    model = text_value(values.get("ProductType"), lockdown.product_type)
+                    if supported_device(model, values.get("DeviceClass")) is not True:
+                        return
+                    name = text_value(values.get("DeviceName"))
+                    system = text_value(values.get("ProductVersion"))
+                    if not all((name, model, system)):
                         raise UserError(tr("device_info_incomplete", udid=udid))
-                    if kind == "Native":
-                        requires_pairing = False  # Successful native pairing + RSD handshake.
-                    elif lockdown.paired:
+                    if lockdown.paired:
                         if lockdown.udid != udid:
                             raise UserError(tr("device_mismatch"))
-                        requires_pairing = False
                     elif kind != "USB":
                         raise ConnectionError(tr("network_pairing_required"))
-                    else:
-                        requires_pairing = True
-                    device = Device(
-                        udid=udid, name=name, system=system,
-                        # Advertised transports, not a connectivity check of every path.
-                        transports=tuple(kind for kind in ("Network", "USB") if kind in transports),
-                        requires_pairing=requires_pairing,
-                        lockdown=lockdown,
-                        native_tunnel=native_tunnel,
-                        routes=routes[index:],
-                    )
-                    devices.append(device)
-                    lockdown = None  # Ownership moves to the candidate until selection.
-                    native_tunnel = None
+                    # Native has not been tried yet, even if metadata needed USB.
+                    routes = ("Native", "Network", "USB") if udid in native_info else (
+                        ("Network", "USB") if kind == "Network" else ("USB",))
+                    devices.append(Device(
+                        udid=udid, name=name, system=system, transports=advertised,
+                        requires_pairing=not lockdown.paired, lockdown=lockdown, routes=routes,
+                    ))
+                    lockdown = None
                     return
                 finally:
                     if lockdown is not None:
                         await lockdown.close()
-                    if native_tunnel is not None:
-                        await native_tunnel.aclose()
             except Exception as exc:
                 LOGGER.warning(tr("device_info_failed", udid=udid, transport=kind, error=error_detail(exc)))
-                continue
-        return None
+        if not advertised:
+            LOGGER.warning(tr("device_info_incomplete", udid=udid))
 
     try:
         async with asyncio.TaskGroup() as tasks:
@@ -447,18 +490,23 @@ async def enable_wifi_on_usb(lockdown) -> None:
 
 async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
     """Download only when mounting is necessary; all partial files stay in state."""
-    from pymobiledevice3.services.mobile_image_mounter import LATEST_DDI_BUILD_ID
     from developer_disk_image.repo import DEVELOPER_DISK_IMAGE_REPO_RAW_URL_FORMAT
     import requests
 
     folder.mkdir(parents=True, exist_ok=True)
     image, manifest, trust = (folder / name for name in ("Image.dmg", "BuildManifest.plist", "Image.trustcache"))
-    if all(p.is_file() and p.stat().st_size for p in (image, manifest, trust)):
+    def valid_cache():
         try:
-            if plistlib.loads(manifest.read_bytes()).get("ProductBuildVersion") == LATEST_DDI_BUILD_ID:
-                return image, manifest, trust
-        except (ValueError, plistlib.InvalidFileException):
-            pass
+            for name, _, digest in DDI_ASSETS:
+                with (folder / name).open("rb") as handle:
+                    if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
+                        return False
+            return plistlib.loads(manifest.read_bytes()).get("ProductBuildVersion") == DDI_BUILD_ID
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return False
+
+    if valid_cache():
+        return image, manifest, trust
     LOGGER.info(tr("downloading"))
     cancelled = threading.Event()
 
@@ -466,13 +514,14 @@ async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
         # An interrupted worker is joined below; it never outlives this command.
         with requests.Session() as client, tempfile.TemporaryDirectory(dir=folder) as temporary:
             downloaded = []
-            for local, remote in ((image, "Image.dmg"), (trust, "Image.dmg.trustcache"),
-                                  (manifest, "BuildManifest.plist")):
+            for name, remote, expected_digest in DDI_ASSETS:
+                local = folder / name
                 if cancelled.is_set():
                     return
                 url = DEVELOPER_DISK_IMAGE_REPO_RAW_URL_FORMAT.format(
-                    ref="main", path=f"PersonalizedImages/Xcode_iOS_DDI_Personalized/{remote}")
+                    ref=DDI_REVISION, path=f"PersonalizedImages/Xcode_iOS_DDI_Personalized/{remote}")
                 target = Path(temporary) / local.name
+                digest = hashlib.sha256()
                 with client.get(url, stream=True, timeout=(8, 15)) as response:
                     response.raise_for_status()
                     with target.open("wb") as handle:
@@ -480,11 +529,14 @@ async def download_ddi(folder: Path) -> tuple[Path, Path, Path]:
                             if cancelled.is_set():
                                 return
                             handle.write(chunk)
+                            digest.update(chunk)
                 if not target.stat().st_size:
                     raise UserError(tr("empty_image"))
+                if digest.hexdigest() != expected_digest:
+                    raise UserError(tr("image_integrity_failed", name=name))
                 downloaded.append((target, local))
-            data = plistlib.loads(downloaded[-1][0].read_bytes())
-            if data.get("ProductBuildVersion") != LATEST_DDI_BUILD_ID:
+            data = plistlib.loads((Path(temporary) / manifest.name).read_bytes())
+            if data.get("ProductBuildVersion") != DDI_BUILD_ID:
                 raise UserError(tr("image_version_changed"))
             for temporary_file, destination in downloaded:
                 os.replace(temporary_file, destination)
@@ -548,6 +600,8 @@ class Backend:
         from pymobiledevice3.services.mobile_image_mounter import PersonalizedImageMounter
 
         LOGGER.info(tr("checking_device"))
+        if supported_device(text_value(provider.product_type), provider.all_values.get("DeviceClass")) is not True:
+            raise UserError(tr("unsupported_device"))
         if Version(provider.product_version) < Version("17.4"):
             raise UserError(tr("unsupported_os"))
         if not await asyncio.wait_for(provider.get_developer_mode_status(), CONNECT_TIMEOUT):
@@ -567,8 +621,10 @@ class Backend:
             return
         from pymobiledevice3.lockdown import create_using_usbmux
 
+        reuse = (device.lockdown is not None
+                 and device.lockdown.service.mux_device.connection_type == "USB")
         try:
-            lockdown = await asyncio.wait_for(
+            lockdown = device.lockdown if reuse else await asyncio.wait_for(
                 create_using_usbmux(serial=device.udid, connection_type="USB", autopair=False),
                 CONNECT_TIMEOUT,
             )
@@ -577,15 +633,39 @@ class Backend:
                 await prepare_pairing(lockdown, device.udid, "USB")
                 await enable_wifi_on_usb(lockdown)
             finally:
-                await lockdown.close()
+                if not reuse:
+                    await lockdown.close()
         except Exception as exc:
             LOGGER.warning(tr("usb_access_setup_failed", error=error_detail(exc)))
 
-    @asynccontextmanager
-    async def connect_native(self, device):
+    async def open_location_session(self, resources, rsd, transport):
+        """Open and retain the real service channel without setting/clearing a location."""
+        from pymobiledevice3.exceptions import InvalidServiceError
         from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
         from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
 
+        LOGGER.info(tr("starting_location_service"))
+        try:
+            rsd.get_service_port(DvtProvider.RSD_SERVICE_NAME)
+        except InvalidServiceError as exc:
+            raise LocationServiceError(tr("location_service_missing")) from exc
+        dvt = DvtProvider(rsd)
+        resources.push_async_callback(dvt.close)
+        try:
+            await asyncio.wait_for(dvt.connect(), SERVICE_TIMEOUT)
+        except Exception as exc:
+            raise LocationServiceError(tr("location_service_connect_failed", error=error_detail(exc))) from exc
+        location = LocationSimulation(dvt)
+        resources.push_async_callback(location.close)
+        try:
+            await asyncio.wait_for(location.connect(), SERVICE_TIMEOUT)
+        except Exception as exc:
+            raise LocationServiceError(tr("location_service_probe_failed", error=error_detail(exc))) from exc
+        LOGGER.info(tr("location_service_ready"))
+        return Session(location, dvt, transport)
+
+    @asynccontextmanager
+    async def connect_native(self, device):
         async with AsyncExitStack() as resources:
             if device.native_tunnel is not None:
                 tunnel, device.native_tunnel = device.native_tunnel, None
@@ -609,10 +689,7 @@ class Backend:
                 rsd = tunnel.rsd
                 if rsd.udid != device.udid:
                     raise UserError(tr("tunnel_mismatch"))
-            LOGGER.info(tr("starting_location_service"))
-            dvt = await asyncio.wait_for(resources.enter_async_context(DvtProvider(rsd)), SERVICE_TIMEOUT)
-            location = await asyncio.wait_for(resources.enter_async_context(LocationSimulation(dvt)), SERVICE_TIMEOUT)
-            yield Session(location, dvt, "Native")
+            yield await self.open_location_session(resources, rsd, "Native")
 
     @asynccontextmanager
     async def connect(self, device, transport):
@@ -623,11 +700,10 @@ class Backend:
 
         from pymobiledevice3.lockdown import create_using_usbmux
         from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
-        from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
-        from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
 
         async with AsyncExitStack() as resources:
-            if device.lockdown is not None:
+            if (device.lockdown is not None
+                    and device.lockdown.service.mux_device.connection_type == transport):
                 lockdown, device.lockdown = device.lockdown, None
                 LOGGER.info(tr("reusing_connection", transport=tr("wireless") if transport == "Network" else "USB"))
             else:
@@ -651,14 +727,13 @@ class Backend:
                 rsd = await asyncio.wait_for(resources.enter_async_context(tunnel), SERVICE_TIMEOUT)
                 if rsd.udid != device.udid:
                     raise UserError(tr("tunnel_mismatch"))
-                dvt = await asyncio.wait_for(resources.enter_async_context(DvtProvider(rsd)), SERVICE_TIMEOUT)
-                location = await asyncio.wait_for(resources.enter_async_context(LocationSimulation(dvt)), SERVICE_TIMEOUT)
-                yield Session(location, dvt, transport)
+                yield await self.open_location_session(resources, rsd, transport)
 
 
 async def run_device(device, latitude, longitude, backend, output=print):
     failures = []
     last_error = None
+    service_failed = False
     # Discovery keeps its successful connection and the untried fallback routes.
     transports = device.routes
     for index, transport in enumerate(transports):
@@ -681,11 +756,13 @@ async def run_device(device, latitude, longitude, backend, output=print):
             if entered:
                 raise UserError(tr("session_error", error=error_detail(exc))) from exc
             last_error = exc
+            service_failed = service_failed or isinstance(exc, LocationServiceError)
             failures.append(f"{transport}: {error_detail(exc)}")
             if index + 1 < len(transports):
                 LOGGER.warning(tr("route_fallback", route=transport, error=error_detail(exc),
                                   next_route=transports[index + 1]))
-    raise UserError(tr("connect_failed") + "\n" + "\n".join(failures)) from last_error
+    message = tr("location_prepare_failed" if service_failed else "connect_failed")
+    raise UserError(message + "\n" + "\n".join(failures)) from last_error
 
 
 async def execute(device, latitude, longitude, state):

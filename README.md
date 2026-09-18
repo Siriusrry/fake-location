@@ -30,7 +30,6 @@ When using a virtual environment, you can run the following command once to avoi
 ./fake_position.sh <latitude> <longitude>
 ```
 
-- A single device is selected automatically. When multiple devices are found, their names, OS versions, and device IDs are listed so you can choose the target.
 - Wireless and wired connections to the same device appear as one device. If the wireless connection fails, the tool automatically falls back to a wired connection.
 - The device must be paired, unlocked, and have Developer Mode enabled. The tool prompts you to pair it on first use. Wireless access also requires Wi-Fi connections to be enabled on the device and a network connection that can reach the Mac.
 
