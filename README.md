@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Simulate the location of an iPhone or iPad from a Mac. Wireless connections are preferred, with automatic USB fallback for the same device. Press Ctrl+C to clear the simulated location and exit.
+Simulate the location of an iPhone or iPad from a Mac. Apple's native connection is preferred. After the initial pairing, a USB connection is no longer required.
 
 Supports macOS (Apple Silicon / Intel), Python 3.11+, and iOS / iPadOS 17.4+. Powered by [pymobiledevice3](https://github.com/doronz88/pymobiledevice3), with dependency versions pinned in `requirements.txt`.
 
@@ -30,8 +30,8 @@ When using a virtual environment, you can run the following command once to avoi
 ./fake_position.sh <latitude> <longitude>
 ```
 
-- Wireless and wired connections to the same device appear as one device. If the wireless connection fails, the tool automatically falls back to a wired connection.
 - The device must be paired, unlocked, and have Developer Mode enabled. The tool prompts you to pair it on first use. Wireless access also requires Wi-Fi connections to be enabled on the device and a network connection that can reach the Mac.
+- If the wireless connection fails, the tool automatically falls back to a wired connection.
 
 ## Cache and temporary files
 
